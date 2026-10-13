@@ -4,7 +4,6 @@ from serial.tools import list_ports
 from . import protocol
 
 # Error and warning codes
-USB_NO_ERROR = 0                        # No USB error occurred.
 USB_DEVICE_NOT_FOUND = 301              # Device was not found
 USB_CONNECTION_FAILED = 302             # USB connection failed
 USB_NOT_CONNECTED = 303                 # USB is not connected
@@ -20,7 +19,8 @@ class USBManager:
         """Initialize USBManager parameters and internal buffers.
 
         Args:
-            timeout: Read and write timeout in seconds, applied to the serial connection.
+            timeout: Read and write timeout in seconds, applied to the serial
+            connection.
         """
         self.port = None
         self.baudrate = 115200  # This value is ignored by the USB CDC
@@ -30,15 +30,14 @@ class USBManager:
         self.product_name = "ytcsc-bcl"
         self._ser: serial.Serial | None = None
         self._read_buffer = bytearray(1 + (len(protocol.PROTOCOL_REGISTER_FORMATS) * 2))
+        self._error_and_warnings: list[int] = []
 
-    def connect(self) -> int:
+    def connect(self) -> None:
         """Locate the target hardware and establish a USB CDC connection.
 
         Search for a device matching the configured VID, PID, and product
-        name, then open its serial port.
-
-        Returns:
-            USB_NO_ERROR (0) on success, or a specific USB error code.
+        name, then open its serial port. Any errors encountered during 
+        connection are appended to the internal error/warning queue.
         """
         ports = list_ports.comports()
         target_port = None
@@ -46,7 +45,8 @@ class USBManager:
             if p.vid == self.vid and p.pid == self.pid and p.product is not None and self.product_name in p.product:
                 target_port = p.device
         if target_port is None:
-            return USB_DEVICE_NOT_FOUND
+            self._error_and_warnings.append(USB_DEVICE_NOT_FOUND)
+            return
         if self.is_connected():
             self.close()
         try:
@@ -58,11 +58,12 @@ class USBManager:
             self._ser.reset_input_buffer()
             self._ser.reset_output_buffer()
             self.port = target_port
-            return USB_NO_ERROR
+            return
         except (serial.SerialException, OSError):
             self._ser = None
             self.port = None
-            return USB_CONNECTION_FAILED
+            self._error_and_warnings.append(USB_CONNECTION_FAILED)
+            return
 
     def is_connected(self) -> bool:
         """Check whether the serial port is open.
@@ -93,7 +94,7 @@ class USBManager:
         values: list[int] | None = None,
         start_read_address: int = 0x00,
         read_count: int = 0,
-    ) -> tuple[tuple[int, ...] | None, int]:
+    ) -> tuple[int, ...] | None:
         """Execute a synchronous register write/read transaction.
 
         Args:
@@ -103,35 +104,56 @@ class USBManager:
             read_count: Number of consecutive registers to read.
 
         Returns:
-            A tuple containing:
-                - hardware_values (tuple[int, ...] | None): Unpacked register values, or None if a fatal error occurs.
-                - error_code (int): USB_NO_ERROR (0) on success, or a specific error code on fatal failure.
+            hardware_values (tuple[int, ...] | None): Unpacked register
+            values, or None if a fatal error occurs.
         """
         if not self.is_connected() or self._ser is None:
-            return None, USB_NOT_CONNECTED
+            self._error_and_warnings.append(USB_NOT_CONNECTED)
+            return None
         packed_cmd, error = protocol.pack_command_transfer(
             start_write_address=start_write_address,
             values=values,
             start_read_address=start_read_address,
             read_count=read_count)
         if error != protocol.PROTOCOL_NO_ERROR or packed_cmd is None:
-            return None, error
+            self._error_and_warnings.append(error)
+            return None
         expected_bytes = 1 + (2 * read_count)
         if expected_bytes > len(self._read_buffer):
-            return None, USB_READ_BUFFER_OUT_OF_BOUNDS
+            self._error_and_warnings.append(USB_READ_BUFFER_OUT_OF_BOUNDS)
+            return None
         try:
             self._ser.write(packed_cmd)
         except (serial.SerialException, OSError):
             self.close()
-            return None, USB_WRITE_ERROR
+            self._error_and_warnings.append(USB_WRITE_ERROR)
+            return None
         try:
             bytes_read = self._ser.readinto(memoryview(self._read_buffer)[:expected_bytes])
             if bytes_read != expected_bytes:
-                return None, USB_READ_ERROR
-            return protocol.unpack_response_transfer(
+                self._error_and_warnings.append(USB_READ_ERROR)
+                return None
+            unpacked_msg, error = protocol.unpack_response_transfer(
                 raw_bytes=bytes(self._read_buffer[:expected_bytes]),
                 start_read_address=start_read_address,
                 read_count=read_count)
+            if error != protocol.PROTOCOL_NO_ERROR or unpacked_msg is None:
+                self._error_and_warnings.append(error)
+                return None
+            return unpacked_msg
         except (serial.SerialException, OSError):
             self.close()
-            return None, USB_READ_ERROR
+            self._error_and_warnings.append(USB_READ_ERROR)
+            return None
+
+    def get_next_error_or_warning(self) -> int | None:
+            """
+            Retrieve and remove the oldest error or warning code. The queue
+            follows FIFO (First In, First Out) order.
+    
+            Returns:
+                The oldest queued code, or None if the queue is empty.
+            """
+            if not self._error_and_warnings:
+                return None
+            return self._error_and_warnings.pop(0)
