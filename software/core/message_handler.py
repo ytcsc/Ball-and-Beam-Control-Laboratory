@@ -45,6 +45,17 @@ class MessageHandler:
         """
         return len(self._msgs) > 0
 
+    def has_errors(self) -> bool:
+        """Checks whether there is any fatal error code in the queue. 
+
+        A fatal error is identified if the remainder of dividing the code
+        by 100 is between 1 and 50 (inclusive).
+
+        Returns:
+            bool: True if at least one error code exists, False otherwise.
+        """
+        return any(1 <= (code % 100) <= 50 for code in self._msgs)
+
     def clear_msgs(self) -> None:
         """Removes all messages from the queue."""
         self._msgs.clear()
